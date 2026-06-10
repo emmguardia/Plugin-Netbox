@@ -1,0 +1,85 @@
+# =============================================================================
+# CronJob de synchronisation cluster -> NetBox, toutes les 5 minutes.
+#
+# Variante "cluster local" : le cluster qui héberge NetBox s'inventorie
+# lui-même. Le job lit l'API Kubernetes en interne (ServiceAccount + RBAC en
+# lecture seule) et pousse vers NetBox via le Service interne (http://netbox:8080).
+# Pur stdlib Python, aucune dépendance à installer.
+#
+# Avant d'appliquer, créer la ConfigMap (le script) et le Secret (le token) :
+#
+#   kubectl -n netbox create configmap netbox-k3s-sync-script \
+#       --from-file=sync_k3s.py=/tmp/sync_k3s.py
+#
+#   kubectl -n netbox create secret generic netbox-k3s-sync-token \
+#       --from-literal=token='nbt_VOTRE_TOKEN'
+#
+# Puis : kubectl apply -f sync-cronjob.yaml
+# =============================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: netbox-k3s-sync
+  namespace: netbox
+---
+# Lecture seule, à l'échelle du cluster, sur namespaces / pods / services / nodes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: netbox-k3s-sync-read
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "pods", "services", "nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: netbox-k3s-sync-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: netbox-k3s-sync-read
+subjects:
+  - kind: ServiceAccount
+    name: netbox-k3s-sync
+    namespace: netbox
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: netbox-k3s-sync
+  namespace: netbox
+spec:
+  schedule: "*/5 * * * *"          # toutes les 5 minutes
+  concurrencyPolicy: Forbid         # pas deux syncs en parallèle
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300     # tue le job s'il dépasse 5 min
+      template:
+        spec:
+          serviceAccountName: netbox-k3s-sync
+          restartPolicy: Never
+          containers:
+            - name: sync
+              image: python:3.12-slim
+              command: ["python", "/scripts/sync_k3s.py"]
+              env:
+                - {name: NETBOX_URL, value: "http://netbox:8080"}
+                - {name: K3S_CLUSTER, value: "mon-cluster"}   # nom logique dans NetBox
+                - name: NETBOX_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: netbox-k3s-sync-token
+                      key: token
+              volumeMounts:
+                - {name: script, mountPath: /scripts, readOnly: true}
+          volumes:
+            - name: script
+              configMap:
+                name: netbox-k3s-sync-script

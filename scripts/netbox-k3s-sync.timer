@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the netbox-k3s sync every hour
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+# Spread load a little if multiple timers fire together.
+RandomizedDelaySec=2min
+Persistent=true
+Unit=netbox-k3s-sync.service
+
+[Install]
+WantedBy=timers.target

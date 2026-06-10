@@ -1,0 +1,61 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-6">
+    <div class="card">
+      <h2 class="card-header">K3s Service</h2>
+      <table class="table table-hover attr-table">
+        <tr>
+          <th scope="row">Name</th>
+          <td>{{ object.name }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Namespace</th>
+          <td>{{ object.namespace|linkify }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Cluster</th>
+          <td>{{ object.namespace.cluster|linkify }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Type</th>
+          <td>{% badge object.get_type_display bg_color=object.get_type_color %}</td>
+        </tr>
+        <tr>
+          <th scope="row">Cluster IP</th>
+          <td>{{ object.cluster_ip|placeholder }}</td>
+        </tr>
+        <tr>
+          <th scope="row">External IP</th>
+          <td>{{ object.external_ip|placeholder }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Ports</th>
+          <td>{{ object.ports|placeholder }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Last sync</th>
+          <td>{{ object.last_updated }}</td>
+        </tr>
+      </table>
+    </div>
+    {% include 'inc/panels/tags.html' %}
+  </div>
+  <div class="col col-md-6">
+    <div class="card">
+      <h2 class="card-header">Selector</h2>
+      <div class="card-body">
+        {% for k, v in object.selector.items %}
+          <span class="badge text-bg-secondary" style="margin: 2px;">{{ k }}={{ v }}</span>
+        {% empty %}
+          <span class="text-muted">&mdash;</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% include 'inc/panels/custom_fields.html' %}
+    {% include 'inc/panels/comments.html' %}
+  </div>
+</div>
+{% endblock %}

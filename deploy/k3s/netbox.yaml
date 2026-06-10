@@ -1,0 +1,258 @@
+# =============================================================================
+# NetBox sur k3s avec le plugin netbox_k3s intégré.
+#
+# Contenu : PostgreSQL + Redis + NetBox (web) + worker RQ + Service NodePort.
+# Le plugin est monté en hostPath et rendu importable via PYTHONPATH=/plugins
+# (web ET worker) — pas besoin de pip ni de registre d'images.
+#
+# Avant d'appliquer :
+#   - remplacer toutes les valeurs CHANGE_ME (voir README.md) ;
+#   - vérifier que le hostPath contient bien le dossier netbox_k3s/ ;
+#   - adapter le domaine, l'image et le bloc REMOTE_AUTH_* (SSO) à votre
+#     environnement — supprimer ce bloc si vous n'avez pas de SSO.
+#
+# SECRETS : ce fichier versionné ne contient que des placeholders. Conservez la
+# version renseignée hors du dépôt git.
+# =============================================================================
+---
+# Configuration NetBox (base de données, Redis, clé secrète, SSO éventuel).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: netbox-config
+  namespace: netbox
+data:
+  configuration.py: |
+    ALLOWED_HOSTS = ['*']
+    DATABASE = {
+        'NAME': 'netbox',
+        'USER': 'netbox',
+        'PASSWORD': 'CHANGE_ME_mot_de_passe_postgres',
+        'HOST': 'netbox-postgres',
+        'PORT': '',
+        'CONN_MAX_AGE': 300,
+    }
+    REDIS = {
+        'tasks': {
+            'HOST': 'netbox-redis',
+            'PORT': 6379,
+            'DATABASE': 0,
+            'SSL': False,
+        },
+        'caching': {
+            'HOST': 'netbox-redis',
+            'PORT': 6379,
+            'DATABASE': 1,
+            'SSL': False,
+        }
+    }
+    SECRET_KEY = 'CHANGE_ME__openssl_rand_base64_50__au_moins_50_caracteres_xxxxx'
+
+    CSRF_TRUSTED_ORIGINS = ['https://netbox.example.com']
+    USE_X_FORWARDED_HOST = True
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+    # --- SSO via reverse proxy d'authentification (optionnel) ---------------
+    # Supprimer ce bloc si vous n'utilisez pas de SSO. Adapter REMOTE_AUTH_HEADER
+    # a l'en-tete envoye par votre proxy (exemple ci-dessous : Authentik).
+    REMOTE_AUTH_ENABLED = True
+    REMOTE_AUTH_BACKEND = 'netbox.authentication.RemoteUserBackend'
+    REMOTE_AUTH_HEADER = 'HTTP_X_AUTHENTIK_USERNAME'
+    REMOTE_AUTH_AUTO_CREATE_USER = True
+    REMOTE_AUTH_DEFAULT_GROUPS = []
+    REMOTE_AUTH_DEFAULT_PERMISSIONS = {}
+    LOGIN_REQUIRED = True
+---
+# Config additionnelle pour le plugin (chargée en plus de configuration.py).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: netbox-plugin-config
+  namespace: netbox
+data:
+  plugins.py: |
+    PLUGINS = ["netbox_k3s"]
+
+    PLUGINS_CONFIG = {
+        "netbox_k3s": {
+            "top_level_menu": True,
+        },
+    }
+
+    # Requis en NetBox 4.6 pour pouvoir créer des tokens d'API (script de sync).
+    API_TOKEN_PEPPERS = {1: "CHANGE_ME__openssl_rand_base64_50__ne_plus_changer_ensuite_xxxx"}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: netbox-postgres-data
+  namespace: netbox
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName omis => classe par défaut de k3s (local-path)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netbox-postgres
+  namespace: netbox
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: netbox-postgres}}
+  template:
+    metadata: {labels: {app: netbox-postgres}}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - {name: POSTGRES_DB, value: netbox}
+            - {name: POSTGRES_USER, value: netbox}
+            # Doit correspondre au PASSWORD de configuration.py ci-dessus.
+            - {name: POSTGRES_PASSWORD, value: "CHANGE_ME_mot_de_passe_postgres"}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports: [{containerPort: 5432}]
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: netbox-postgres-data}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: netbox-postgres
+  namespace: netbox
+spec:
+  selector: {app: netbox-postgres}
+  ports: [{port: 5432, targetPort: 5432}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netbox-redis
+  namespace: netbox
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: netbox-redis}}
+  template:
+    metadata: {labels: {app: netbox-redis}}
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command: ["redis-server", "--maxmemory-policy", "allkeys-lru"]
+          ports: [{containerPort: 6379}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: netbox-redis
+  namespace: netbox
+spec:
+  selector: {app: netbox-redis}
+  ports: [{port: 6379, targetPort: 6379}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netbox
+  namespace: netbox
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: netbox}}
+  template:
+    metadata: {labels: {app: netbox}}
+    spec:
+      containers:
+        - name: netbox
+          image: netboxcommunity/netbox:latest
+          env:
+            - {name: SKIP_SUPERUSER, value: "true"}
+            - {name: SKIP_STARTUP_SCRIPTS, value: "true"}
+            # Rend le plugin importable par Django :
+            - {name: PYTHONPATH, value: "/plugins"}
+          ports: [{containerPort: 8080}]
+          readinessProbe:
+            httpGet: {path: /login/, port: 8080}
+            initialDelaySeconds: 120
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 60
+          volumeMounts:
+            - {name: config, mountPath: /etc/netbox/config/configuration.py, subPath: configuration.py, readOnly: true}
+            - {name: plugin-config, mountPath: /etc/netbox/config/plugins.py, subPath: plugins.py, readOnly: true}
+            - {name: plugin-src, mountPath: /plugins, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: netbox-config}
+        - name: plugin-config
+          configMap: {name: netbox-plugin-config}
+        - name: plugin-src
+          hostPath:
+            path: /opt/netbox-plugins
+            type: Directory
+---
+# Worker RQ — monte le plugin et le PYTHONPATH comme le pod web : un worker qui
+# charge PLUGINS sans pouvoir importer le module ne démarre pas.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netbox-worker
+  namespace: netbox
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: netbox-worker}}
+  template:
+    metadata: {labels: {app: netbox-worker}}
+    spec:
+      containers:
+        - name: netbox-worker
+          image: netboxcommunity/netbox:latest
+          # Attend la fin des migrations (appliquées par le pod web) avant de
+          # lancer le worker, sinon il plante sur un schéma incomplet.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "En attente de la fin des migrations..."
+              until /opt/netbox/venv/bin/python /opt/netbox/netbox/manage.py migrate --check; do
+                echo "  migrations pas prêtes, nouvelle tentative dans 5s..."
+                sleep 5
+              done
+              echo "Migrations OK -> démarrage du rqworker."
+              exec /opt/netbox/venv/bin/python /opt/netbox/netbox/manage.py rqworker high default low
+          env:
+            - {name: PYTHONPATH, value: "/plugins"}
+          volumeMounts:
+            - {name: config, mountPath: /etc/netbox/config/configuration.py, subPath: configuration.py, readOnly: true}
+            - {name: plugin-config, mountPath: /etc/netbox/config/plugins.py, subPath: plugins.py, readOnly: true}
+            - {name: plugin-src, mountPath: /plugins, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: netbox-config}
+        - name: plugin-config
+          configMap: {name: netbox-plugin-config}
+        - name: plugin-src
+          hostPath:
+            path: /opt/netbox-plugins
+            type: Directory
+---
+# Service "netbox" : même nom/port qu'avant => l'Ingress Authentik reste valide.
+apiVersion: v1
+kind: Service
+metadata:
+  name: netbox
+  namespace: netbox
+spec:
+  type: NodePort
+  selector: {app: netbox}
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30500

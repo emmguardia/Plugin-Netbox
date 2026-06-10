@@ -1,0 +1,53 @@
+#!/bin/sh
+# Minimal fake kubectl for end-to-end testing of sync_k3s.py.
+# Recognises:  kubectl get <namespaces|pods|services> [-A] -o json
+resource="$2"
+case "$resource" in
+  nodes)
+    cat <<'JSON'
+{"items":[
+  {"metadata":{"name":"demo-node-1"},
+   "status":{"nodeInfo":{"kubeletVersion":"v1.30.2+k3s1"}}}
+]}
+JSON
+    ;;
+  namespaces)
+    cat <<'JSON'
+{"items":[
+  {"metadata":{"name":"default"}},
+  {"metadata":{"name":"kube-system"}}
+]}
+JSON
+    ;;
+  pods)
+    cat <<'JSON'
+{"items":[
+  {"metadata":{"name":"web-0","namespace":"default","labels":{"app":"web","tier":"front"}},
+   "spec":{"nodeName":"demo-node-1","containers":[{"image":"nginx:1.27"},{"image":"sidecar:1"}]},
+   "status":{"phase":"Running","podIP":"10.42.0.5","startTime":"2026-06-10T08:00:00Z",
+             "containerStatuses":[{"restartCount":2},{"restartCount":1}]}},
+  {"metadata":{"name":"coredns-abc","namespace":"kube-system"},
+   "spec":{"nodeName":"demo-node-1","containers":[{"image":"rancher/coredns:1.11"}]},
+   "status":{"phase":"Running","podIP":"10.42.0.6"}},
+  {"metadata":{"name":"web-0","namespace":"kube-system"},
+   "spec":{"nodeName":"demo-node-2","containers":[{"image":"busybox:1.36"}]},
+   "status":{"phase":"Pending","podIP":"10.42.0.7"}}
+]}
+JSON
+    ;;
+  services)
+    cat <<'JSON'
+{"items":[
+  {"metadata":{"name":"web","namespace":"default"},
+   "spec":{"type":"LoadBalancer","clusterIP":"10.43.0.10","selector":{"app":"web"},
+           "ports":[{"port":80,"targetPort":8080,"protocol":"TCP"}]},
+   "status":{"loadBalancer":{"ingress":[{"ip":"192.0.2.10"}]}}},
+  {"metadata":{"name":"kube-dns","namespace":"kube-system"},
+   "spec":{"type":"ClusterIP","clusterIP":"10.43.0.10","ports":[{"port":53,"targetPort":53,"protocol":"UDP"}]}}
+]}
+JSON
+    ;;
+  *)
+    echo "{\"items\":[]}"
+    ;;
+esac

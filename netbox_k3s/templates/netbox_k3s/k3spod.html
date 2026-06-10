@@ -1,0 +1,81 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-6">
+    <div class="card">
+      <h2 class="card-header">K3s Pod</h2>
+      <table class="table table-hover attr-table">
+        <tr>
+          <th scope="row">Name</th>
+          <td>{{ object.name }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Namespace</th>
+          <td>{{ object.namespace|linkify }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Cluster</th>
+          <td>{{ object.namespace.cluster|linkify }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Status</th>
+          <td>{% badge object.get_status_display bg_color=object.get_status_color %}</td>
+        </tr>
+        <tr>
+          <th scope="row">Image</th>
+          <td>{{ object.image|placeholder }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Node</th>
+          <td>{{ object.node|placeholder }}</td>
+        </tr>
+        <tr>
+          <th scope="row">IP address</th>
+          <td>{{ object.ip_address|placeholder }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Restarts</th>
+          <td>
+            {% if object.restarts > 5 %}
+              <span class="badge text-bg-red">{{ object.restarts }}</span>
+            {% elif object.restarts > 0 %}
+              <span class="badge text-bg-yellow">{{ object.restarts }}</span>
+            {% else %}
+              <span class="badge text-bg-green">0</span>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <th scope="row">Containers</th>
+          <td>{{ object.container_count }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Started</th>
+          <td>{{ object.started|placeholder }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Last sync</th>
+          <td>{{ object.last_updated }}</td>
+        </tr>
+      </table>
+    </div>
+    {% include 'inc/panels/tags.html' %}
+  </div>
+  <div class="col col-md-6">
+    <div class="card">
+      <h2 class="card-header">Labels</h2>
+      <div class="card-body">
+        {% for k, v in object.labels.items %}
+          <span class="badge text-bg-secondary" style="margin: 2px;">{{ k }}={{ v }}</span>
+        {% empty %}
+          <span class="text-muted">&mdash;</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% include 'inc/panels/custom_fields.html' %}
+    {% include 'inc/panels/comments.html' %}
+  </div>
+</div>
+{% endblock %}

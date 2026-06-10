@@ -1,0 +1,96 @@
+# =============================================================================
+# CronJob de synchronisation cluster -> NetBox, toutes les 5 minutes.
+#
+# Variante "cluster distant" : ce cluster pousse son inventaire vers une
+# instance NetBox hébergée sur un autre serveur (NodePort, IP directe ou VPN).
+# Remplacer IP-SERVER et le port par l'adresse de votre NetBox.
+#
+# Remarque : si NetBox est derrière un proxy d'authentification (SSO), ciblez
+# le NodePort ou un accès direct, pas le domaine public, sinon le proxy
+# interceptera les appels d'API.
+#
+# Avant d'appliquer, sur ce cluster :
+#
+#   kubectl create namespace netbox-sync
+#   kubectl -n netbox-sync create configmap netbox-k3s-sync-script \
+#       --from-file=sync_k3s.py=/tmp/sync_k3s.py
+#   kubectl -n netbox-sync create secret generic netbox-k3s-sync-token \
+#       --from-literal=token='nbt_VOTRE_TOKEN'
+#   kubectl apply -f sync-cronjob-remote.yaml
+# =============================================================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: netbox-sync
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: netbox-k3s-sync
+  namespace: netbox-sync
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: netbox-k3s-sync-read
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "pods", "services", "nodes"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: netbox-k3s-sync-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: netbox-k3s-sync-read
+subjects:
+  - kind: ServiceAccount
+    name: netbox-k3s-sync
+    namespace: netbox-sync
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: netbox-k3s-sync
+  namespace: netbox-sync
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          serviceAccountName: netbox-k3s-sync
+          restartPolicy: Never
+          # hostNetwork : le pod utilise le réseau de l'hôte, donc il atteint le
+          # serveur NetBox exactement comme la machine elle-même (utile à
+          # travers un VPN ou un routage spécifique).
+          hostNetwork: true
+          dnsPolicy: Default
+          containers:
+            - name: sync
+              image: python:3.12-slim
+              command: ["python", "/scripts/sync_k3s.py"]
+              env:
+                - {name: NETBOX_URL, value: "http://IP-SERVER:30500"}
+                - {name: K3S_CLUSTER, value: "cluster-distant"}   # nom logique dans NetBox
+                - name: NETBOX_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: netbox-k3s-sync-token
+                      key: token
+              volumeMounts:
+                - {name: script, mountPath: /scripts, readOnly: true}
+          volumes:
+            - name: script
+              configMap:
+                name: netbox-k3s-sync-script

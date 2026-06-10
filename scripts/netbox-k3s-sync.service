@@ -1,0 +1,15 @@
+[Unit]
+Description=Sync k3s state into NetBox (netbox-k3s plugin)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Adapter l'URL, le nom du cluster et les chemins a votre environnement.
+Environment=NETBOX_URL=http://IP-SERVER:8080
+Environment=K3S_CLUSTER=mon-cluster
+# Le token reste hors du fichier d'unite, dans un fichier protege :
+EnvironmentFile=/etc/netbox-k3s-sync.env
+ExecStart=/usr/bin/python3 /opt/netbox-k3s/sync_k3s.py
+# kubectl a besoin d'un kubeconfig ; celui de k3s par defaut :
+Environment=KUBECONFIG=/etc/rancher/k3s/k3s.yaml

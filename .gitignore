@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Local-only files with real secrets (keep them out of git)
+*.local.yaml
+*.env
+
+# OS / editor
+.DS_Store
+Thumbs.db

@@ -1,0 +1,48 @@
+{% extends 'generic/object.html' %}
+{% load helpers %}
+{% load render_table from django_tables2 %}
+
+{% block content %}
+<div class="row">
+  <div class="col col-md-6">
+    <div class="card">
+      <h2 class="card-header">K3s Namespace</h2>
+      <table class="table table-hover attr-table">
+        <tr>
+          <th scope="row">Name</th>
+          <td>{{ object.name }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Cluster</th>
+          <td>{{ object.cluster|linkify }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Pods</th>
+          <td>{{ object.pods.count }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Services</th>
+          <td>{{ object.services.count }}</td>
+        </tr>
+      </table>
+    </div>
+    {% include 'inc/panels/tags.html' %}
+  </div>
+  <div class="col col-md-6">
+    {% include 'inc/panels/custom_fields.html' %}
+    {% include 'inc/panels/comments.html' %}
+  </div>
+</div>
+<div class="row">
+  <div class="col col-md-12">
+    <div class="card">
+      <h2 class="card-header">Pods</h2>
+      {% render_table pod_table 'inc/table.html' %}
+    </div>
+    <div class="card">
+      <h2 class="card-header">Services</h2>
+      {% render_table service_table 'inc/table.html' %}
+    </div>
+  </div>
+</div>
+{% endblock %}
