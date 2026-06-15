@@ -33,6 +33,13 @@ import urllib.request
 
 API_PREFIX = "/api/plugins/k3s/"
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+# Max objects per bulk request (NetBox handles large batches, but keep it sane).
+CHUNK = 100
+
+# Fields compared to decide whether an existing object needs an update. FK and
+# format-fragile fields (namespace, started) are excluded on purpose.
+_POD_FIELDS = ("image", "status", "node", "ip_address", "restarts", "container_count", "labels")
+_SVC_FIELDS = ("type", "cluster_ip", "external_ip", "ports", "selector")
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +92,7 @@ class NetBox:
             self.ctx.check_hostname = False
             self.ctx.verify_mode = ssl.CERT_NONE
 
-    def _request(self, method: str, path: str, data: dict | None = None) -> dict:
+    def _request(self, method: str, path: str, data=None):
         url = urllib.parse.urljoin(self.base, path.lstrip("/"))
         body = json.dumps(data).encode() if data is not None else None
         req = urllib.request.Request(
@@ -98,24 +105,14 @@ class NetBox:
                 "Accept": "application/json",
             },
         )
-        with urllib.request.urlopen(req, context=self.ctx, timeout=30) as resp:
-            return json.load(resp)
+        with urllib.request.urlopen(req, context=self.ctx, timeout=60) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else None
 
     def get(self, path: str, params: dict | None = None) -> dict:
         if params:
             path = f"{path}?{urllib.parse.urlencode(params)}"
         return self._request("GET", path)
-
-    def delete(self, endpoint: str, obj_id: int) -> None:
-        url = urllib.parse.urljoin(
-            self.base, (API_PREFIX + endpoint).lstrip("/") + f"{obj_id}/"
-        )
-        req = urllib.request.Request(
-            url, method="DELETE",
-            headers={"Authorization": f"Token {self.token}", "Accept": "application/json"},
-        )
-        with urllib.request.urlopen(req, context=self.ctx, timeout=30):
-            pass  # 204 No Content
 
     def list_all(self, endpoint: str, params: dict | None = None) -> list[dict]:
         """Return every object of an endpoint, following pagination."""
@@ -128,16 +125,30 @@ class NetBox:
                 return results
             page_params["offset"] += page_params["limit"]
 
-    def upsert(self, endpoint: str, match: dict, data: dict) -> dict:
-        """Idempotent create-or-update.
+    # --- Bulk operations: one HTTP request per chunk, not per object ---------
+    def bulk_create(self, endpoint: str, items: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for i in range(0, len(items), CHUNK):
+            res = self._request("POST", API_PREFIX + endpoint, items[i:i + CHUNK])
+            if isinstance(res, list):
+                out.extend(res)
+        return out
 
-        Args:
-            endpoint: API endpoint, e.g. ``"pods/"``.
-            match:    Filter params to find an existing object. FKs use the
-                      ``<field>_id`` form (e.g. ``namespace_id``).
-            data:     Full request body for create/update. FKs use the plain
-                      field name + PK (e.g. ``namespace``).
-        """
+    def bulk_update(self, endpoint: str, items: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for i in range(0, len(items), CHUNK):
+            res = self._request("PATCH", API_PREFIX + endpoint, items[i:i + CHUNK])
+            if isinstance(res, list):
+                out.extend(res)
+        return out
+
+    def bulk_delete(self, endpoint: str, ids: list[int]) -> None:
+        payload = [{"id": i} for i in ids]
+        for i in range(0, len(payload), CHUNK):
+            self._request("DELETE", API_PREFIX + endpoint, payload[i:i + CHUNK])
+
+    def upsert(self, endpoint: str, match: dict, data: dict) -> dict:
+        """Single-object create-or-update (used for the cluster object)."""
         existing = self.get(API_PREFIX + endpoint, params={**match, "limit": 1})
         results = existing.get("results", [])
         if results:
@@ -146,11 +157,82 @@ class NetBox:
         return self._request("POST", API_PREFIX + endpoint, data)
 
 
+def _changed(existing: dict, desired: dict, fields) -> bool:
+    """True if any compared field differs between NetBox and the live state."""
+    return any(existing.get(f) != desired.get(f) for f in fields)
+
+
 # ---------------------------------------------------------------------------
 # Sync logic
 # ---------------------------------------------------------------------------
+def _pod_data(item, ns_id):
+    meta, spec, status = item["metadata"], item.get("spec", {}), item.get("status", {})
+    containers = spec.get("containers", [])
+    image = containers[0]["image"] if containers else ""
+    restarts = sum(cs.get("restartCount", 0) for cs in status.get("containerStatuses", []))
+    return {
+        "name": meta["name"],
+        "namespace": ns_id,
+        "image": image[:512],
+        "status": status.get("phase", "Unknown"),
+        "node": spec.get("nodeName", "") or "",
+        "ip_address": status.get("podIP") or None,
+        "restarts": restarts,
+        "container_count": len(containers),
+        "started": status.get("startTime") or None,
+        "labels": meta.get("labels") or {},
+    }
+
+
+def _svc_data(item, ns_id):
+    meta, spec = item["metadata"], item.get("spec", {})
+    ports = ", ".join(
+        f"{p.get('port')}:{p.get('targetPort', '')}/{p.get('protocol', 'TCP')}"
+        for p in spec.get("ports", [])
+    )
+    cluster_ip = spec.get("clusterIP")
+    if cluster_ip in ("None", ""):
+        cluster_ip = None
+    lb = item.get("status", {}).get("loadBalancer", {}).get("ingress", [])
+    external_ip = ""
+    if lb:
+        external_ip = lb[0].get("ip") or lb[0].get("hostname") or ""
+    elif spec.get("externalIPs"):
+        external_ip = spec["externalIPs"][0]
+    return {
+        "name": meta["name"],
+        "namespace": ns_id,
+        "type": spec.get("type", "ClusterIP"),
+        "cluster_ip": cluster_ip,
+        "external_ip": external_ip[:253],
+        "ports": ports[:255],
+        "selector": spec.get("selector") or {},
+    }
+
+
+def _reconcile(nb, endpoint, desired, existing_by_key, compare_fields):
+    """Bulk create/update/delete to make NetBox match ``desired``.
+
+    desired:          {key: data} for the live objects.
+    existing_by_key:  {key: netbox_object} currently in NetBox.
+    Returns (created_objects, n_created, n_updated, n_deleted).
+    """
+    to_create = [data for key, data in desired.items() if key not in existing_by_key]
+    to_update = []
+    for key, data in desired.items():
+        ex = existing_by_key.get(key)
+        if ex is not None and _changed(ex, data, compare_fields):
+            to_update.append({"id": ex["id"], **data})
+    to_delete = [ex["id"] for key, ex in existing_by_key.items() if key not in desired]
+
+    created = nb.bulk_create(endpoint, to_create)
+    nb.bulk_update(endpoint, to_update)
+    nb.bulk_delete(endpoint, to_delete)
+    return created, len(to_create), len(to_update), len(to_delete)
+
+
 def sync(nb: NetBox, cluster_name: str) -> None:
-    # 1. Ensure the cluster exists; grab version + node count from the nodes.
+    # 1. Cluster (single object).
     nodes = kube_get("nodes").get("items", [])
     version = ""
     if nodes:
@@ -158,116 +240,50 @@ def sync(nb: NetBox, cluster_name: str) -> None:
     cluster = nb.upsert(
         "clusters/",
         match={"name": cluster_name},
-        data={
-            "name": cluster_name,
-            "status": "active",
-            "version": version[:50],
-            "node_count": len(nodes),
-        },
+        data={"name": cluster_name, "status": "active",
+              "version": version[:50], "node_count": len(nodes)},
     )
     cluster_id = cluster["id"]
     print(f"Cluster '{cluster_name}' -> id {cluster_id} ({version}, {len(nodes)} nodes)")
 
-    # 2. Namespaces. Map ns name -> NetBox namespace id.
-    ns_ids: dict[str, int] = {}
-    for item in kube_get("namespaces").get("items", []):
-        name = item["metadata"]["name"]
-        obj = nb.upsert(
-            "namespaces/",
-            match={"name": name, "cluster_id": cluster_id},
-            data={"name": name, "cluster": cluster_id},
-        )
-        ns_ids[name] = obj["id"]
-    print(f"Synced {len(ns_ids)} namespaces")
+    # 2. Namespaces (no mutable fields -> create + prune only, no update).
+    existing_ns = {n["name"]: n for n in nb.list_all("namespaces/", {"cluster_id": cluster_id})}
+    live_ns_names = [it["metadata"]["name"] for it in kube_get("namespaces").get("items", [])]
+    desired_ns = {n: {"name": n, "cluster": cluster_id} for n in live_ns_names}
+    # Deleting a stale namespace here cascades to its leftover pods/services.
+    created_ns, ns_c, _, ns_d = _reconcile(nb, "namespaces/", desired_ns, existing_ns, ())
+    ns_ids = {n: o["id"] for n, o in existing_ns.items() if n in desired_ns}
+    for o in created_ns:
+        ns_ids[o["name"]] = o["id"]
+    print(f"Namespaces: {len(ns_ids)} live (+{ns_c} new, -{ns_d} removed)")
 
-    # 3. Pods.
-    seen_pod_ids: set[int] = set()
+    # 3. Pods. Key = (namespace_id, name).
+    desired_pods = {}
     for item in kube_get("pods").get("items", []):
-        meta, spec, status = item["metadata"], item.get("spec", {}), item.get("status", {})
-        ns = meta["namespace"]
+        ns = item["metadata"]["namespace"]
         if ns not in ns_ids:
             continue
-        containers = spec.get("containers", [])
-        image = containers[0]["image"] if containers else ""
-        restarts = sum(
-            cs.get("restartCount", 0) for cs in status.get("containerStatuses", [])
-        )
-        obj = nb.upsert(
-            "pods/",
-            match={"name": meta["name"], "namespace_id": ns_ids[ns]},
-            data={
-                "name": meta["name"],
-                "namespace": ns_ids[ns],
-                "image": image[:512],
-                "status": status.get("phase", "Unknown"),
-                "node": spec.get("nodeName", "") or "",
-                "ip_address": status.get("podIP") or None,
-                "restarts": restarts,
-                "container_count": len(containers),
-                "started": status.get("startTime") or None,
-                "labels": meta.get("labels") or {},
-            },
-        )
-        seen_pod_ids.add(obj["id"])
-    print(f"Synced {len(seen_pod_ids)} pods")
+        desired_pods[(ns_ids[ns], item["metadata"]["name"])] = _pod_data(item, ns_ids[ns])
+    existing_pods = {
+        (p["namespace"]["id"], p["name"]): p
+        for p in nb.list_all("pods/", {"cluster_id": cluster_id})
+    }
+    _, pc, pu, pd = _reconcile(nb, "pods/", desired_pods, existing_pods, _POD_FIELDS)
+    print(f"Pods: {len(desired_pods)} live (+{pc} new, ~{pu} updated, -{pd} removed)")
 
-    # 4. Services.
-    seen_svc_ids: set[int] = set()
+    # 4. Services. Key = (namespace_id, name).
+    desired_svc = {}
     for item in kube_get("services").get("items", []):
-        meta, spec = item["metadata"], item.get("spec", {})
-        ns = meta["namespace"]
+        ns = item["metadata"]["namespace"]
         if ns not in ns_ids:
             continue
-        ports = ", ".join(
-            f"{p.get('port')}:{p.get('targetPort', '')}/{p.get('protocol', 'TCP')}"
-            for p in spec.get("ports", [])
-        )
-        cluster_ip = spec.get("clusterIP")
-        if cluster_ip in ("None", ""):
-            cluster_ip = None
-        # External address: LoadBalancer ingress first, then spec.externalIPs.
-        lb = item.get("status", {}).get("loadBalancer", {}).get("ingress", [])
-        external_ip = ""
-        if lb:
-            external_ip = lb[0].get("ip") or lb[0].get("hostname") or ""
-        elif spec.get("externalIPs"):
-            external_ip = spec["externalIPs"][0]
-        obj = nb.upsert(
-            "services/",
-            match={"name": meta["name"], "namespace_id": ns_ids[ns]},
-            data={
-                "name": meta["name"],
-                "namespace": ns_ids[ns],
-                "type": spec.get("type", "ClusterIP"),
-                "cluster_ip": cluster_ip,
-                "external_ip": external_ip[:253],
-                "ports": ports[:255],
-                "selector": spec.get("selector") or {},
-            },
-        )
-        seen_svc_ids.add(obj["id"])
-    print(f"Synced {len(seen_svc_ids)} services")
-
-    # 5. Prune: remove NetBox objects (scoped to this cluster) that no longer
-    # exist in the live cluster — e.g. completed Job pods with unique names.
-    pruned = {"pods": 0, "services": 0, "namespaces": 0}
-    for obj in nb.list_all("pods/", params={"cluster_id": cluster_id, "brief": "true"}):
-        if obj["id"] not in seen_pod_ids:
-            nb.delete("pods/", obj["id"])
-            pruned["pods"] += 1
-    for obj in nb.list_all("services/", params={"cluster_id": cluster_id, "brief": "true"}):
-        if obj["id"] not in seen_svc_ids:
-            nb.delete("services/", obj["id"])
-            pruned["services"] += 1
-    live_ns_ids = set(ns_ids.values())
-    for obj in nb.list_all("namespaces/", params={"cluster_id": cluster_id, "brief": "true"}):
-        if obj["id"] not in live_ns_ids:
-            nb.delete("namespaces/", obj["id"])  # cascade deletes its pods/services
-            pruned["namespaces"] += 1
-    print(
-        f"Pruned {pruned['pods']} pods, {pruned['services']} services, "
-        f"{pruned['namespaces']} namespaces"
-    )
+        desired_svc[(ns_ids[ns], item["metadata"]["name"])] = _svc_data(item, ns_ids[ns])
+    existing_svc = {
+        (s["namespace"]["id"], s["name"]): s
+        for s in nb.list_all("services/", {"cluster_id": cluster_id})
+    }
+    _, sc, su, sd = _reconcile(nb, "services/", desired_svc, existing_svc, _SVC_FIELDS)
+    print(f"Services: {len(desired_svc)} live (+{sc} new, ~{su} updated, -{sd} removed)")
 
 
 def main() -> int:

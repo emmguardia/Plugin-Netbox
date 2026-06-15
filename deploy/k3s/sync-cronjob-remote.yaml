@@ -60,8 +60,9 @@ metadata:
 spec:
   schedule: "*/5 * * * *"
   concurrencyPolicy: Forbid
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 3
+  # Peu d'historique : les pods de sync ne s'accumulent pas dans l'inventaire.
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 0
   startingDeadlineSeconds: 120
   jobTemplate:
     spec:
